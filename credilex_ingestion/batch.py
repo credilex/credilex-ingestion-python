@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from credilex_ingestion.client import IngestClient
-from credilex_ingestion.errors import IngestError
 
 DEFAULT_BATCH_SIZE = 500
 

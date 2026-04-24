@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import json as json_mod
 import time
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, BinaryIO, Dict, List, Optional, Union
 
 import httpx
 
@@ -41,6 +42,7 @@ from credilex_ingestion.errors import (
 
 DEFAULT_BASE_URL = "https://ingest.credilex.it"
 DEFAULT_TIMEOUT = 60.0
+DEFAULT_UPLOAD_TIMEOUT = 600.0  # 10 min per large R2 uploads
 DEFAULT_MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -63,12 +65,21 @@ def _parse_error_response(status: int, body_text: str) -> IngestError:
 
     if status == 401:
         return AuthError(msg, code=code, details=data)
+    if status == 402:
+        # Payment required — credenziale a pagamento esaurita.
+        return QuotaError(msg, code=code or "quota.payment_required", details=data)
     if status == 403:
         return AuthError(msg, code=code or "forbidden", details=data)
     if status == 404:
         return NotFoundError(msg, code=code, details=data)
+    if status == 409:
+        # Idempotency-Key conflict, session stato non valido, ecc.
+        violations = data.get("violations") or []
+        return ValidationError(msg, code=code or "integrity.conflict", details=data, violations=violations)
     if status == 413 or status == 429:
         return QuotaError(msg, code=code, details=data)
+    if status == 415:
+        return IngestError(msg, code=code or "syntax.content_type_invalid", details=data)
     if status == 422:
         violations = data.get("violations") or []
         return ValidationError(msg, code=code, details=data, violations=violations)
@@ -256,13 +267,65 @@ class IngestClient(_ClientBase):
         resp = self._request("GET", f"/ingest/v1/pratiche/{external_id_pratica}/documents")
         return self._handle(resp)
 
-    def put_to_r2(self, presigned_put_url: str, file_bytes: bytes, *, content_type: str = "application/octet-stream") -> None:
-        """PUT diretto su R2 usando il presigned URL. Ritorna None, raise su errore."""
-        resp = self._http.put(
-            presigned_put_url,
-            content=file_bytes,
-            headers={"Content-Type": content_type, "Content-Length": str(len(file_bytes))},
-        )
+    def put_to_r2(
+        self,
+        presigned_put_url: str,
+        file_bytes: Optional[bytes] = None,
+        *,
+        file_path: Optional[Union[str, Path]] = None,
+        file_obj: Optional[BinaryIO] = None,
+        content_type: str = "application/octet-stream",
+        timeout: float = DEFAULT_UPLOAD_TIMEOUT,
+    ) -> None:
+        """PUT diretto su R2 usando il presigned URL. Ritorna None, raise su errore.
+
+        Supporta 3 modi di fornire il contenuto (esattamente uno):
+            - file_bytes: bytes in memoria (small files <100MB)
+            - file_path: stream da disco (large files — no OOM)
+            - file_obj: stream da file-like object (deve supportare seek/tell)
+
+        Per backward-compat, `file_bytes` resta accettato come secondo argomento
+        posizionale. `timeout` default 600s per tollerare upload grandi.
+        """
+        sources_provided = sum(x is not None for x in (file_bytes, file_path, file_obj))
+        if sources_provided != 1:
+            raise ValueError(
+                "fornisci esattamente uno tra file_bytes, file_path, file_obj"
+            )
+
+        if file_path is not None:
+            p = Path(file_path)
+            size = p.stat().st_size
+            with p.open("rb") as f:
+                resp = self._http.put(
+                    presigned_put_url,
+                    content=f,
+                    headers={"Content-Type": content_type, "Content-Length": str(size)},
+                    timeout=timeout,
+                )
+        elif file_obj is not None:
+            if not (hasattr(file_obj, "seek") and hasattr(file_obj, "tell")):
+                raise ValueError(
+                    "file_obj deve supportare seek/tell per calcolare Content-Length"
+                )
+            file_obj.seek(0, 2)  # end
+            size = file_obj.tell()
+            file_obj.seek(0)
+            resp = self._http.put(
+                presigned_put_url,
+                content=file_obj,
+                headers={"Content-Type": content_type, "Content-Length": str(size)},
+                timeout=timeout,
+            )
+        else:  # file_bytes
+            assert file_bytes is not None  # narrowing
+            resp = self._http.put(
+                presigned_put_url,
+                content=file_bytes,
+                headers={"Content-Type": content_type, "Content-Length": str(len(file_bytes))},
+                timeout=timeout,
+            )
+
         if resp.status_code >= 400:
             raise IngestError(f"R2 upload failed: HTTP {resp.status_code} -- {resp.text[:500]}")
 
@@ -340,9 +403,27 @@ class AsyncIngestClient(_ClientBase):
         resp = await self._request("POST", "/ingest/v1/pratiche:batch:validate", json=payloads, auth=False)
         return self._handle(resp)
 
-    async def upload_batch(self, *, pratiche: List[dict],
-                           idempotency_key: Optional[str] = None, **kwargs) -> dict:
-        body: Dict[str, Any] = {"pratiche": pratiche, **{k: v for k, v in kwargs.items() if v is not None}}
+    async def upload_batch(
+        self,
+        *,
+        pratiche: List[dict],
+        batch_index: Optional[int] = None,
+        batch_total: Optional[int] = None,
+        batch_sha256: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict:
+        """Upload batch fino a 500 pratiche. Ritorna 207 Multi-Status response.
+
+        Signature allineata a `IngestClient.upload_batch` (kwargs espliciti,
+        non più **kwargs generico).
+        """
+        body: Dict[str, Any] = {"pratiche": pratiche}
+        if batch_index is not None:
+            body["batch_index"] = batch_index
+        if batch_total is not None:
+            body["batch_total"] = batch_total
+        if batch_sha256 is not None:
+            body["batch_sha256"] = batch_sha256
         extra = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         resp = await self._request("POST", "/ingest/v1/pratiche:batch", json=body, extra_headers=extra)
         return self._handle(resp)
@@ -377,8 +458,60 @@ class AsyncIngestClient(_ClientBase):
         resp = await self._request("GET", f"/ingest/v1/pratiche/{external_id_pratica}/documents")
         return self._handle(resp)
 
-    async def put_to_r2(self, presigned_put_url: str, file_bytes: bytes, *, content_type: str = "application/octet-stream") -> None:
-        resp = await self._http.put(presigned_put_url, content=file_bytes,
-                                    headers={"Content-Type": content_type, "Content-Length": str(len(file_bytes))})
+    async def put_to_r2(
+        self,
+        presigned_put_url: str,
+        file_bytes: Optional[bytes] = None,
+        *,
+        file_path: Optional[Union[str, Path]] = None,
+        file_obj: Optional[BinaryIO] = None,
+        content_type: str = "application/octet-stream",
+        timeout: float = DEFAULT_UPLOAD_TIMEOUT,
+    ) -> None:
+        """PUT diretto su R2 usando il presigned URL. Ritorna None, raise su errore.
+
+        Stesso contract di `IngestClient.put_to_r2`: esattamente uno tra
+        `file_bytes`, `file_path`, `file_obj`.
+
+        TRADE-OFF ASYNC: httpx.AsyncClient non accetta file handle sync come
+        content (richiede AsyncByteStream). Per evitare una dipendenza hard su
+        `aiofiles`, leggiamo il file in memoria prima dell'upload anche per
+        `file_path`/`file_obj`. Il risparmio RAM di streaming è quindi limitato
+        al sync client. Per upload multi-GB async, leggi chunk con `aiofiles`
+        e pre-serializza, oppure usa `IngestClient` sync.
+        """
+        sources_provided = sum(x is not None for x in (file_bytes, file_path, file_obj))
+        if sources_provided != 1:
+            raise ValueError(
+                "fornisci esattamente uno tra file_bytes, file_path, file_obj"
+            )
+
+        if file_path is not None:
+            p = Path(file_path)
+            size = p.stat().st_size
+            # async trade-off: leggi bytes (no aiofiles hard dep)
+            payload = p.read_bytes()
+        elif file_obj is not None:
+            if not (hasattr(file_obj, "seek") and hasattr(file_obj, "tell")
+                    and hasattr(file_obj, "read")):
+                raise ValueError(
+                    "file_obj deve supportare seek/tell/read per calcolare Content-Length"
+                )
+            file_obj.seek(0, 2)
+            size = file_obj.tell()
+            file_obj.seek(0)
+            payload = file_obj.read()
+        else:
+            assert file_bytes is not None
+            payload = file_bytes
+            size = len(file_bytes)
+
+        resp = await self._http.put(
+            presigned_put_url,
+            content=payload,
+            headers={"Content-Type": content_type, "Content-Length": str(size)},
+            timeout=timeout,
+        )
+
         if resp.status_code >= 400:
-            raise IngestError(f"R2 upload failed: HTTP {resp.status_code}")
+            raise IngestError(f"R2 upload failed: HTTP {resp.status_code} -- {resp.text[:500]}")

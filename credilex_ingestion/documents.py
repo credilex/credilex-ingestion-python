@@ -25,9 +25,8 @@ Uso:
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from credilex_ingestion.client import IngestClient
 from credilex_ingestion.errors import IngestError
@@ -79,11 +78,15 @@ def upload_document(
     if (file_path is None) == (file_bytes is None):
         raise ValueError("fornisci esattamente uno tra file_path e file_bytes")
 
-    if file_bytes is None:
-        file_bytes = Path(file_path).read_bytes()
-
-    sha = _sha256_bytes(file_bytes)
-    size = len(file_bytes)
+    # Calcolo sha + size: se abbiamo file_path usiamo streaming (evita OOM su file grandi)
+    if file_path is not None:
+        assert file_path is not None  # narrowing per mypy
+        sha = _sha256_file(file_path)
+        size = Path(file_path).stat().st_size
+    else:
+        assert file_bytes is not None  # narrowing per mypy
+        sha = _sha256_bytes(file_bytes)
+        size = len(file_bytes)
 
     doc_meta = {
         "external_id": external_document_id,
@@ -108,12 +111,19 @@ def upload_document(
         raise IngestError("documents:prepare returned empty uploads")
     presigned = uploads[0]
 
-    # Step 2: PUT su R2
-    client.put_to_r2(
-        presigned["presigned_put_url"],
-        file_bytes=file_bytes,
-        content_type=mime,
-    )
+    # Step 2: PUT su R2 — stream da disco se disponibile (no OOM su large files)
+    if file_path is not None:
+        client.put_to_r2(
+            presigned["presigned_put_url"],
+            file_path=file_path,
+            content_type=mime,
+        )
+    else:
+        client.put_to_r2(
+            presigned["presigned_put_url"],
+            file_bytes=file_bytes,
+            content_type=mime,
+        )
 
     # Step 3: commit per verify + AV
     commit_resp = client.documents_commit(
@@ -177,9 +187,9 @@ def upload_documents_batch(
         raise IngestError(f"prepare returned {len(uploads)} URLs for {len(documents)} docs")
 
     results = []
-    for i, (presigned, (file_bytes, sha, mime)) in enumerate(zip(uploads, file_data_list)):
+    for presigned, (file_bytes, sha, mime) in zip(uploads, file_data_list):
         try:
-            client.put_to_r2(presigned["presigned_put_url"], file_bytes, content_type=mime)
+            client.put_to_r2(presigned["presigned_put_url"], file_bytes=file_bytes, content_type=mime)
             commit_resp = client.documents_commit(
                 external_id_pratica, presigned["document_id"], client_sha256=sha,
             )
