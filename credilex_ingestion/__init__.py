@@ -12,6 +12,7 @@ from credilex_ingestion.client import AsyncIngestClient, IngestClient
 from credilex_ingestion.documents import upload_document, upload_documents_batch
 from credilex_ingestion.errors import (
     AuthError,
+    IngestConfigError,
     IngestError,
     NotFoundError,
     QuotaError,
@@ -33,4 +34,5 @@ __all__ = [
     "QuotaError",
     "NotFoundError",
     "ServerError",
+    "IngestConfigError",
 ]

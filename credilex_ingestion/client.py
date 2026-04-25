@@ -33,6 +33,7 @@ from credilex_ingestion._version import __version__
 from credilex_ingestion.auth import build_signed_headers
 from credilex_ingestion.errors import (
     AuthError,
+    IngestConfigError,
     IngestError,
     NotFoundError,
     QuotaError,
@@ -40,7 +41,19 @@ from credilex_ingestion.errors import (
     ValidationError,
 )
 
-DEFAULT_BASE_URL = "https://ingest.credilex.it"
+# Environment URLs
+PROD_BASE_URL = "https://ingest.credilex.it"
+SANDBOX_BASE_URL = "https://sandbox.credilex.it"
+# Backward-compat alias
+DEFAULT_BASE_URL = PROD_BASE_URL
+
+# Map client env -> expected server header value (X-Credilex-Env)
+_ENV_HEADER_MAP = {
+    "production": "prod",
+    "sandbox": "sandbox",
+}
+_VALID_ENVS = ("production", "sandbox")
+
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_UPLOAD_TIMEOUT = 600.0  # 10 min per large R2 uploads
 DEFAULT_MAX_RETRIES = 3
@@ -91,24 +104,76 @@ def _parse_error_response(status: int, body_text: str) -> IngestError:
 class _ClientBase:
     """Shared config + URL builder."""
 
+    # Class-level constants (also exposed as `IngestClient.PROD_BASE_URL` etc.)
+    PROD_BASE_URL = PROD_BASE_URL
+    SANDBOX_BASE_URL = SANDBOX_BASE_URL
+
     def __init__(
         self,
         *,
         api_id: str,
         api_secret: str,
-        base_url: str = DEFAULT_BASE_URL,
+        env: str = "production",
+        base_url: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         user_agent: Optional[str] = None,
     ):
         if not api_id or not api_secret:
             raise ValueError("api_id and api_secret are required")
+        if env not in _VALID_ENVS:
+            raise ValueError(
+                f"env must be 'production' or 'sandbox', got {env!r}"
+            )
         self.api_id = api_id
         self.api_secret = api_secret
-        self.base_url = base_url.rstrip("/")
+        self.env = env
+        # base_url= esplicito vince sempre (custom enterprise endpoint).
+        # Altrimenti deriva dall'env.
+        if base_url is not None:
+            resolved_base = base_url
+        elif env == "sandbox":
+            resolved_base = SANDBOX_BASE_URL
+        else:  # production
+            resolved_base = PROD_BASE_URL
+        self.base_url = resolved_base.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
         self.user_agent = user_agent or f"credilex-ingestion-python/{__version__}"
+
+    def _expected_env_header(self) -> str:
+        """Valore atteso dell'header `X-Credilex-Env` nelle response server."""
+        return _ENV_HEADER_MAP[self.env]
+
+    def _verify_env_header(self, resp: httpx.Response) -> None:
+        """Verifica che `X-Credilex-Env` (se presente su 2xx) matchi l'env client.
+
+        Skip volutamente:
+        - response 4xx/5xx (es. 401 da nginx, 502 da gateway senza header)
+        - response 2xx senza header (compat con server vecchi)
+
+        Raise `IngestConfigError` solo quando il server lo dichiara esplicitamente
+        e il valore non matcha — sintomo chiaro di base_url/env sbagliato.
+        """
+        if not (200 <= resp.status_code < 300 or resp.status_code == 207):
+            return
+        server_env = resp.headers.get("X-Credilex-Env")
+        if server_env is None:
+            return
+        expected = self._expected_env_header()
+        if server_env.strip().lower() != expected:
+            raise IngestConfigError(
+                f"environment mismatch: expected {expected!r} "
+                f"(client env={self.env!r}) but server returned {server_env!r} "
+                f"on {self.base_url} — check your base_url / env parameter",
+                code="config.env_mismatch",
+                details={
+                    "client_env": self.env,
+                    "expected_header": expected,
+                    "server_header": server_env,
+                    "base_url": self.base_url,
+                },
+            )
 
     def _sign(self, method: str, path: str, query: str, body: bytes) -> Dict[str, str]:
         hdrs = build_signed_headers(
@@ -186,6 +251,7 @@ class IngestClient(_ClientBase):
     def _handle(self, resp: httpx.Response) -> Any:
         """200-299 -> json; altrimenti -> raise tipizzato."""
         if 200 <= resp.status_code < 300 or resp.status_code == 207:
+            self._verify_env_header(resp)
             try:
                 return resp.json()
             except json_mod.JSONDecodeError:
@@ -242,6 +308,7 @@ class IngestClient(_ClientBase):
     def download_errors_ndjson(self) -> str:
         resp = self._request("GET", "/ingest/v1/pratiche/errors.ndjson")
         if 200 <= resp.status_code < 300:
+            self._verify_env_header(resp)
             return resp.text
         raise _parse_error_response(resp.status_code, resp.text)
 
@@ -385,6 +452,7 @@ class AsyncIngestClient(_ClientBase):
 
     def _handle(self, resp: httpx.Response) -> Any:
         if 200 <= resp.status_code < 300 or resp.status_code == 207:
+            self._verify_env_header(resp)
             try:
                 return resp.json()
             except json_mod.JSONDecodeError:
@@ -439,6 +507,7 @@ class AsyncIngestClient(_ClientBase):
     async def download_errors_ndjson(self) -> str:
         resp = await self._request("GET", "/ingest/v1/pratiche/errors.ndjson")
         if 200 <= resp.status_code < 300:
+            self._verify_env_header(resp)
             return resp.text
         raise _parse_error_response(resp.status_code, resp.text)
 

@@ -47,3 +47,12 @@ class NotFoundError(IngestError):
 
 class ServerError(IngestError):
     """Errore 5xx interno server."""
+
+
+class IngestConfigError(IngestError):
+    """Errore di configurazione client (es. mismatch env tra client e server).
+
+    Tipico caso: client configurato con `env="sandbox"` ma il server risponde
+    con `X-Credilex-Env: prod` (o viceversa). Indica quasi sempre un base_url
+    sbagliato o un mix-up di credenziali tra ambienti.
+    """

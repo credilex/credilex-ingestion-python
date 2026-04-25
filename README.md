@@ -25,6 +25,35 @@ pip install "credilex-ingestion[pydantic]"
 pip install "credilex-ingestion[dev]"
 ```
 
+## Environments
+
+The SDK supports two environments out of the box. Switch with the `env=` parameter:
+
+| Env          | Base URL                          | Use for                                  |
+|--------------|-----------------------------------|------------------------------------------|
+| `production` | `https://ingest.credilex.it`      | Live data (default)                      |
+| `sandbox`    | `https://sandbox.credilex.it`     | Development & integration testing        |
+
+```python
+from credilex_ingestion import IngestClient
+
+# Sandbox (development & integration testing)
+client = IngestClient(api_id="...", api_secret="...", env="sandbox")
+
+# Production (default — env="production" is implicit)
+client = IngestClient(api_id="...", api_secret="...", env="production")
+
+# Custom URL (per chi ha endpoint enterprise dedicato)
+client = IngestClient(api_id="...", api_secret="...", base_url="https://custom.example.com")
+```
+
+Sandbox credentials are issued separately from production: an `api_id`/`api_secret`
+pair is bound to a single environment and will not authenticate against the other.
+The SDK verifies the `X-Credilex-Env` response header on each successful response
+and raises `IngestConfigError` if the server's environment doesn't match the
+client's configured `env` — typically a sign that `base_url` is pointing the wrong
+way or production credentials are being used against sandbox (or vice versa).
+
 ## Quickstart
 
 ```python
@@ -33,7 +62,7 @@ from credilex_ingestion import IngestClient
 client = IngestClient(
     api_id="clx_id_live_xxxxxxxxxxxxxxxx",
     api_secret="clx_sk_live_...",
-    base_url="https://ingest.credilex.it",
+    env="production",  # or "sandbox" for the test environment
 )
 
 # Dry-run validation
@@ -98,6 +127,7 @@ for batch in BatchSplitter(all_pratiche, size=500):
 from credilex_ingestion import (
     IngestClient,
     IngestError,
+    IngestConfigError,
     AuthError,
     IngestValidationError,
     QuotaError,
@@ -107,6 +137,8 @@ client = IngestClient(api_id="...", api_secret="...")
 
 try:
     client.upload_batch(pratiche=[...])
+except IngestConfigError as e:
+    print(f"Environment mismatch (wrong base_url/env?): {e}")
 except AuthError as e:
     print(f"Credentials issue: {e}")
 except IngestValidationError as e:
